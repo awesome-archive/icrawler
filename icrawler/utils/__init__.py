@@ -1,6 +1,7 @@
-from .dup_filter import DupFilter
-from .signal import Signal
-from .proxy_pool import *
+from .cached_queue import CachedQueue
+from .proxy_pool import Proxy, ProxyPool, ProxyScanner
 from .session import Session
+from .signal import Signal
+from .thread_pool import ThreadPool
 
-__all__ = ['dup_filter', 'signal', 'proxy_pool', 'session']
+__all__ = ["CachedQueue", "Proxy", "ProxyPool", "ProxyScanner", "Session", "Signal", "ThreadPool"]

@@ -1,286 +1,277 @@
-# -*- coding: utf-8 -*-
+import errno
+import queue
+import time
+from io import BytesIO
+from threading import current_thread
+from urllib.parse import urlparse
 
-import logging
-import os
-import threading
-import sys
-
-import requests
-from six.moves.urllib.parse import urlparse
 from PIL import Image
-from six import BytesIO
-from six.moves import queue
+
+from .utils import ThreadPool
 
 
-class Downloader(object):
-    """Base class for downloaders.
+class Downloader(ThreadPool):
+    """Base class for downloader.
 
-    Essentially a thread manager, in charge of downloading images and save
-    them in the corresponding paths.
+    A thread pool of downloader threads, in charge of downloading files and
+    saving them in the corresponding paths.
 
     Attributes:
-        img_dir: The root folder where images will be saved.
-        task_queue: A queue storing image downloading tasks, connecting
-                    Parser and Downloader.
-        global_signal: A Signal object for cross-module communication.
-        session: A requests.Session object.
+        task_queue (CachedQueue): A queue storing image downloading tasks,
+            connecting :class:`Parser` and :class:`Downloader`.
+        signal (Signal): A Signal object shared by all components.
+        session (Session): A session object.
         logger: A logging.Logger object used for logging.
-        threads: A list storing all the threading.Thread objects of the parser.
-        thread_num: An integer indicating the number of threads.
-        lock: A threading.Lock object.
+        workers (list): A list of downloader threads.
+        thread_num (int): The number of downloader threads.
+        lock (Lock): A threading.Lock object.
+        storage (BaseStorage): storage backend.
     """
 
-    def __init__(self, img_dir, task_queue, signal, session):
+    def __init__(self, thread_num, signal, session, storage):
         """Init Parser with some shared variables."""
-        self.img_dir = img_dir
-        self.task_queue = task_queue
-        self.global_signal = signal
+        super().__init__(thread_num, out_queue=None, name="downloader")
+        self.signal = signal
         self.session = session
-        self.threads = []
+        self.storage = storage
+        self.file_idx_offset = 0
         self.clear_status()
-        self.set_logger()
 
     def clear_status(self):
         """Reset fetched_num to 0."""
         self.fetched_num = 0
 
-    def set_logger(self):
-        self.logger = logging.getLogger(__name__)
-
-    def set_file_path(self, img_task, save_mode):
-        """Set the path where the image will be saved.
-
-        The default strategy is to save images in the img_dir, with an
-        increasing 6-digit number as the filename. Users can override this
-        method if need to rename the image file or store it in custom paths.
-
-        The goal is also to preserve the extension of the file.
-        The extension is computed from the url: http://some_url/image.XXX?params=a.
-        Where XXX is the extension.
+    def set_file_idx_offset(self, file_idx_offset=0):
+        """Set offset of file index.
 
         Args:
-            img_task: The task dict got from task_queue.
-            save_mode: Indicate the way to handle the image filename if the
-                       output directory is not empty.
+            file_idx_offset: It can be either an integer or 'auto'. If set
+                to an integer, the filename will start from
+                ``file_idx_offset`` + 1. If set to ``'auto'``, the filename
+                will start from existing max file index plus 1.
+        """
+        if isinstance(file_idx_offset, int):
+            self.file_idx_offset = file_idx_offset
+        elif file_idx_offset == "auto":
+            self.file_idx_offset = self.storage.max_file_idx()
+        else:
+            raise ValueError('"file_idx_offset" must be an integer or `auto`')
+
+    def get_filename(self, task, default_ext):
+        """Set the path where the image will be saved.
+
+        The default strategy is to use an increasing 6-digit number as
+        the filename. You can override this method if you want to set custom
+        naming rules. The file extension is kept if it can be obtained from
+        the url, otherwise ``default_ext`` is used as extension.
+
+        Args:
+            task (dict): The task dict got from ``task_queue``.
 
         Output:
-            Fullpath of the image.
+            Filename with extension.
         """
-        url_parsed = urlparse(img_task['img_url'])
-        old_filename = url_parsed[2].split('/')[-1]
-        extension_with_params = old_filename.split('.')
-        extension = 'jpg'
-        if len(extension_with_params) > 1:
-            extension = extension_with_params[-1]
-        if save_mode == 'overwrite':
-            filename = os.path.join(
-                self.img_dir, '{:0>6d}.{}'.format(self.fetched_num, extension))
-        elif save_mode == 'auto':
-            filename = os.path.join(
-                self.img_dir,
-                '{:0>6d}.{}'.format(self.fetched_num + self.filename_start, extension))
-        elif isinstance(save_mode, int):
-            filename = os.path.join(
-                self.img_dir,
-                '{:0>6d}.{}'.format(self.fetched_num + save_mode, extension))
-        else:
-            sys.exit('unknown save_mode: {}'.format(save_mode))
-        return filename
+        url_path = urlparse(task["file_url"])[2]
+        extension = url_path.split(".")[-1] if "." in url_path else default_ext
+        file_idx = self.fetched_num + self.file_idx_offset
+        return f"{file_idx:06d}.{extension}"
 
     def reach_max_num(self):
         """Check if downloaded images reached max num.
 
         Returns:
-            A boolean indicating if downloaded images reached max num.
+            bool: if downloaded images reached max num.
         """
-        if self.global_signal.get('reach_max_num'):
+        if self.signal.get("reach_max_num"):
             return True
         if self.max_num > 0 and self.fetched_num >= self.max_num:
             return True
         else:
             return False
 
-    def _size_smaller(self, sz1, sz2):
-        if sz1[0] < sz2[0] and sz1[1] < sz2[1]:
-            return True
-        else:
-            return False
+    def keep_file(self, task, response, **kwargs):
+        return True
 
-    def _size_greater(self, sz1, sz2):
-        if sz1[0] > sz2[0] and sz1[1] > sz2[1]:
-            return True
-        else:
-            return False
-
-    def download(self, img_task, request_timeout, max_retry=3, min_size=None,
-                 max_size=None, save_mode='overwrite', **kwargs):
+    def download(self, task, default_ext, timeout=5, max_retry=3, overwrite=False, **kwargs):
         """Download the image and save it to the corresponding path.
 
         Args:
-            img_task: The task dict got from task_queue.
-            request_timeout: An integer indicating the timeout of making
-                             requests for downloading images.
-            max_retry: An integer setting the max retry times if request fails.
-            min_size: A tuple containing (width, height) in pixels. Downloaded
-                      images with smaller size than min_size will be discarded.
-            max_size: A tuple containing (width, height) in pixels. Downloaded
-                      images with greater size than max_size will be discarded.
-            save_mode: If set to `overwrite`, the filename will start from
-                       000001.jpg regardless of existing files, if set to `auto`,
-                       the filename will be exist_max + 1, if set to an integer,
-                       the filename will start from save_mode + 1.
+            task (dict): The task dict got from ``task_queue``.
+            timeout (int): Timeout of making requests for downloading images.
+            max_retry (int): the max retry times if the request fails.
             **kwargs: reserved arguments for overriding.
         """
-        img_url = img_task['img_url']
+        file_url = task["file_url"]
+        task["success"] = False
+        task["filename"] = None
         retry = max_retry
-        while retry > 0 and not self.global_signal.get('reach_max_num'):
-            try:
-                response = self.session.get(img_url, timeout=request_timeout)
-            except requests.exceptions.ConnectionError:
-                self.logger.error('Connection error when downloading image %s, '
-                                  'remaining retry time: %d', img_url, retry - 1)
-            except requests.exceptions.HTTPError:
-                self.logger.error('HTTP error when downloading image %s '
-                                  'remaining retry time: %d', img_url, retry - 1)
-            except requests.exceptions.Timeout:
-                self.logger.error('Timeout when downloading image %s '
-                                  'remaining retry time: %d', img_url, retry - 1)
-            except Exception as ex:
-                self.logger.error('Unexcepted error catched when downloading '
-                                  'image %s, error info: %s, remaining retry '
-                                  'time: %d', img_url, ex, retry - 1)
-            else:
-                if response.status_code != 200:
-                    self.logger.error('Unexcepted HTTP status code. Should be 200 '
-                                      'image %s', img_url)
-                    break
-                if min_size is not None or max_size is not None:
-                    # TODO: figure out the error details caused by Pillow
-                    try:
-                        img = Image.open(BytesIO(response.content))
-                    except OSError:
-                        break
-                    except IOError:  # usually non-image urls
-                        break
-                    if (min_size is not None and
-                            not self._size_greater(img.size, min_size)):
-                        return
-                    elif (max_size is not None and
-                          not self._size_smaller(img.size, max_size)):
-                        return
-                if self.reach_max_num():
-                    with self.lock:
-                        if not self.global_signal.get('reach_max_num'):
-                            self.global_signal.set({'reach_max_num': True})
-                            self.logger.info('downloaded images reach max num,'
-                                             ' waiting all threads to exit...')
+
+        if not overwrite:
+            with self.lock:
+                self.fetched_num += 1
+                filename = self.get_filename(task, default_ext)
+                if self.storage.exists(filename):
+                    self.logger.info("skip downloading file %s", filename)
                     return
+                self.fetched_num -= 1
+
+        while retry > 0 and not self.signal.get("reach_max_num") and not self.signal.get("exceed_storage_space"):
+            try:
+                response = self.session.get(file_url, timeout=timeout)
+            except Exception as e:
+                self.logger.error(
+                    "Exception caught when downloading file %s, " "error: %s, remaining retry times: %d",
+                    file_url,
+                    e,
+                    retry - 1,
+                )
+            else:
+                if self.reach_max_num():
+                    self.signal.set(reach_max_num=True)
+                    break
+                elif 200 <= response.status_code < 300:
+                    self.logger.error("Response status code %d, file %s", response.status_code, file_url)
+                    break
+                elif not self.keep_file(task, response, **kwargs):
+                    break
                 with self.lock:
                     self.fetched_num += 1
-                self.logger.info('image #%s\t%s', self.fetched_num, img_url)
-                filename = self.set_file_path(img_task, save_mode)
-                with open(filename, 'wb') as fout:
-                    fout.write(response.content)
+                    filename = self.get_filename(task, default_ext)
+                self.logger.info("image #%s\t%s %s", self.fetched_num, filename, file_url)
+
+                task["success"] = False
+                try:
+                    task["filename"] = filename  # may be zero bytes if OSError happened during write()
+                    self.storage.write(filename, response.content)
+                    task["success"] = True
+                except OSError as o:
+                    # errno.EINVAL -- name too long
+                    if o.errno == errno.ENOSPC:
+                        self.signal.set(exceed_storage_space=True)
+                    else:
+                        raise
                 break
             finally:
                 retry -= 1
 
-    def process_meta(self, img_task):
+    def process_meta(self, task):
         """Process some meta data of the images.
 
         This method should be overridden by users if wanting to do more things
-        other than just downloading the image, such as save annotations.
+        other than just downloading the image, such as saving annotations.
 
         Args:
-            img_task: The task dict got from task_queue. This method will make
-                      use of fields other than 'img_url' in the dict.
+            task (dict): The task dict got from task_queue. This method will
+                make use of fields other than ``file_url`` in the dict.
         """
         pass
 
-    def create_threads(self, **kwargs):
-        """Create parser threads.
-
-        Creates threads named "downloader-xx" counting from 01 to 99, all
-        threads are daemon threads.
-
-        Args:
-            **kwargs: Arguments to be passed to the thread_run() method.
-        """
-        self.threads = []
-        for i in range(self.thread_num):
-            name = 'downloader-{:0>2d}'.format(i + 1)
-            t = threading.Thread(name=name, target=self.thread_run,
-                                 kwargs=kwargs)
-            t.daemon = True
-            self.threads.append(t)
-
-    def max_filename_idx(self, img_dir):
-        max_idx = 0
-        for filename in os.listdir(img_dir):
-            try:
-                idx = int(os.path.splitext(filename)[0])
-            except:
-                continue
-            if idx > max_idx:
-                max_idx = idx
-        return max_idx
-
-    def start(self, thread_num, **kwargs):
-        """Start all the parser threads.
-
-        Args:
-            thread_num: An integer indicating the number of threads to be
-                        created and run.
-            **kwargs: Arguments to be passed to the create_threads() method.
-        """
-        self.thread_num = thread_num
+    def start(self, file_idx_offset=0, *args, **kwargs):
         self.clear_status()
-        if 'save_mode' in kwargs and kwargs['save_mode'] == 'auto':
-            self.filename_start = self.max_filename_idx(self.img_dir)
-        self.create_threads(**kwargs)
-        self.lock = threading.Lock()
-        for t in self.threads:
-            t.start()
-            self.logger.info('thread %s started', t.name)
+        self.set_file_idx_offset(file_idx_offset)
+        self.init_workers(*args, **kwargs)
+        for worker in self.workers:
+            worker.start()
+            self.logger.debug("thread %s started", worker.name)
 
-    def thread_run(self, max_num, queue_timeout=5, request_timeout=5, **kwargs):
-        """Target method of threads.
+    def worker_exec(self, max_num, default_ext="", queue_timeout=5, req_timeout=5, max_idle_time=None, **kwargs):
+        """Target method of workers.
 
-        Get download task from task_queue and then download images and process
-        meta data. A downloader thread will exit in either of the following cases:
+        Get task from ``task_queue`` and then download files and process meta
+        data. A downloader thread will exit in either of the following cases:
+
         1. All parser threads have exited and the task_queue is empty.
         2. Downloaded image number has reached required number(max_num).
+        3. No new downloads for max_idle_time seconds.
 
         Args:
-            queue_timeout: An integer indicating the timeout of getting
-                           tasks from task_queue.
-            request_timeout: An integer indicating the timeout of making
-                              requests for downloading pages.
-            **kwargs: Arguments to be passed to the download() method.
+            max_num (int): Maximum number of images to download
+            queue_timeout (int): Timeout of getting tasks from ``task_queue``.
+            req_timeout (int): Timeout of making requests for downloading pages.
+            max_idle_time (int): Maximum time (in seconds) to wait without receiving new images
+            **kwargs: Arguments passed to the :func:`download` method.
         """
         self.max_num = max_num
-        while True:
-            if self.global_signal.get('reach_max_num'):
-                self.logger.info('downloaded image reached max num, thread %s'
-                                 ' exit', threading.current_thread().name)
-                break
-            try:
-                task = self.task_queue.get(timeout=queue_timeout)
-            except queue.Empty:
-                if self.global_signal.get('parser_exited'):
-                    self.logger.info('no more download task, thread %s exit',
-                                     threading.current_thread().name)
-                    break
-                else:
-                    self.logger.info('%s is waiting for new download tasks',
-                                     threading.current_thread().name)
-            except:
-                self.logger.error('exception in thread %s',
-                                  threading.current_thread().name)
-            else:
-                self.download(task, request_timeout, **kwargs)
-                self.process_meta(task)
-                self.task_queue.task_done()
+        last_download_time = time.time()
 
-    def __exit__(self):
-        self.logger.info('all downloader threads exited')
+        while True:
+            if self.signal.get("reach_max_num"):
+                self.logger.info("downloaded images reach max num, thread %s is ready to exit", current_thread().name)
+                break
+
+            current_time = time.time()
+            if max_idle_time is not None and current_time - last_download_time > max_idle_time and self.fetched_num > 0:
+                self.logger.info("no new images for %d seconds, thread %s exit", max_idle_time, current_thread().name)
+                break
+
+            try:
+                task = self.in_queue.get(timeout=queue_timeout)
+            except queue.Empty:
+                if self.signal.get("parser_exited"):
+                    self.logger.info("no more download task for thread %s", current_thread().name)
+                    break
+                elif self.fetched_num == 0:
+                    self.logger.info("%s is waiting for new download tasks", current_thread().name)
+                else:
+                    self.logger.info("no more images available, thread %s exit", current_thread().name)
+                    break
+            except:
+                self.logger.error("exception in thread %s", current_thread().name)
+            else:
+                success = self.download(task, default_ext, req_timeout, **kwargs)
+                if success:
+                    last_download_time = time.time()
+                self.process_meta(task)
+                self.in_queue.task_done()
+
+        self.logger.info("thread %s exit", current_thread().name)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.logger.info("all downloader threads exited")
+
+
+class ImageDownloader(Downloader):
+    """Downloader specified for images."""
+
+    def _size_lt(self, sz1, sz2):
+        return max(sz1) <= max(sz2) and min(sz1) <= min(sz2)
+
+    def _size_gt(self, sz1, sz2):
+        return max(sz1) >= max(sz2) and min(sz1) >= min(sz2)
+
+    def keep_file(self, task, response, min_size=None, max_size=None):
+        """Decide whether to keep the image
+
+        Compare image size with ``min_size`` and ``max_size`` to decide.
+
+        Args:
+            response (Response): response of requests.
+            min_size (tuple or None): minimum size of required images.
+            max_size (tuple or None): maximum size of required images.
+        Returns:
+            bool: whether to keep the image.
+        """
+        try:
+            img = Image.open(BytesIO(response.content))
+        except OSError:
+            return False
+        task["img_size"] = img.size
+        if min_size and not self._size_gt(img.size, min_size):
+            return False
+        if max_size and not self._size_lt(img.size, max_size):
+            return False
+        return True
+
+    def get_filename(self, task, default_ext):
+        url_path = urlparse(task["file_url"])[2]
+        if "." in url_path:
+            extension = url_path.split(".")[-1]
+            if extension.lower() not in ["jpg", "jpeg", "png", "bmp", "tiff", "gif", "ppm", "pgm"]:
+                extension = default_ext
+        else:
+            extension = default_ext
+        file_idx = self.fetched_num + self.file_idx_offset
+        return f"{file_idx:06d}.{extension}"
+
+    def worker_exec(self, max_num, default_ext="jpg", queue_timeout=5, req_timeout=5, max_idle_time=None, **kwargs):
+        super().worker_exec(max_num, default_ext, queue_timeout, req_timeout, max_idle_time, **kwargs)

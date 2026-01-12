@@ -1,7 +1,4 @@
-# -*- coding: utf-8 -*-
-
-
-class Signal(object):
+class Signal:
     """Signal class
 
     Provides interfaces for set and get some globally shared variables(signals).
@@ -13,10 +10,10 @@ class Signal(object):
 
     def __init__(self):
         """Init Signal with empty dicts"""
-        self.signals = {}
-        self.init_status = {}
+        self._signals = {}
+        self._init_status = {}
 
-    def set(self, signals):
+    def set(self, **signals):
         """Set signals.
 
         Args:
@@ -24,13 +21,13 @@ class Signal(object):
                      {'signal1': True, 'signal2': 10}
         """
         for name in signals:
-            if name not in self.signals:
-                self.init_status[name] = signals[name]
-            self.signals[name] = signals[name]
+            if name not in self._signals:
+                self._init_status[name] = signals[name]
+            self._signals[name] = signals[name]
 
     def reset(self):
         """Reset signals with their initial values"""
-        self.signals = self.init_status
+        self._signals = self._init_status.copy()
 
     def get(self, name):
         """Get a signal value by its name.
@@ -41,11 +38,11 @@ class Signal(object):
         Returns:
             Value of the signal or None if the name is invalid.
         """
-        if name in self.signals:
-            return self.signals[name]
+        if name in self._signals:
+            return self._signals[name]
         else:
             return None
 
     def names(self):
         """Return all the signal names"""
-        return self.signals.keys()
+        return self._signals.keys()
